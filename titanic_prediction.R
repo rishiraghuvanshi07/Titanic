@@ -1,0 +1,119 @@
+library(rpart)
+library(randomForest)
+library(party)
+test<- read.csv("test.csv", sep = ',')
+train<- read.csv("train.csv", sep = ',')
+test$Survived<-0
+#prop.table(table(train$Sex, train$Survived),margin = 1)
+test$Survived[which(test$Sex=="female")]<-1
+
+combi<-rbind(train,test)
+
+
+combi$Fare[which(is.na(combi$Fare))]<-median(combi$Fare, na.rm = TRUE)
+combi$Embarked<-as.character(combi$Embarked)
+combi$Embarked[which(combi$Embarked=='')]<-'S'
+combi$Embarked<-as.factor(combi$Embarked)
+
+combi$Name<-as.character(combi$Name)
+
+combi$FamilySize<- combi$Parch+ combi$SibSp + 1
+combi$Title <- sapply(combi$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][2]})
+combi$Title <- sub(' ', '', combi$Title)
+
+
+combi$Title <- sub(' ', '', combi$Title)
+combi$Title[combi$Title %in% c('Capt', 'Don', 'Major', 'Sir')] <- 'Sir'
+combi$Title[combi$Title %in% c('Dona', 'Lady', 'theCountess', 'Jonkheer')] <- 'Lady'
+combi$Title <- factor(combi$Title)
+combi$Surname <- sapply(combi$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][1]})
+combi$FamilyID <- paste(as.character(combi$FamilySize), combi$Surname, sep="")
+combi$FamilyID[combi$FamilySize <= 2] <- 'Small'
+famIDs <- data.frame(table(combi$FamilyID))
+famIDs <- famIDs[famIDs$Freq <= 2,]
+combi$FamilyID[combi$FamilyID %in% famIDs$Var1] <- 'Small'
+combi$FamilyID <- factor(combi$FamilyID)
+combi$FamilyID2 <- combi$FamilyID
+combi$FamilyID2 <- as.character(combi$FamilyID2)
+combi$FamilyID2[combi$FamilySize <= 3] <- 'Small'
+combi$FamilyID2 <- factor(combi$FamilyID2)
+
+
+agefit<- rpart(Age ~ Parch + SibSp + Pclass + Title + FamilySize +Embarked + Fare , data = train, method = "anova")
+combi$Age[is.na(combi$Age)]<-predict(agefit, combi[is.na(combi$Age),])
+
+train<-combi[1:891,]
+test<-combi[892:1309,]
+
+##### First Layer
+
+# logical Regression model
+model_logistic<-glm(as.factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare +Embarked + Title, data = train, family = binomial)
+predict_logistic <- predict(model_logistic, test, type = 'response')
+train$logistic<-predict(model_logistic, train, type = 'response')
+train$logistic<-ifelse(train$logistic >0.5,1,0) # accuracy on training dataset of 83%
+
+
+summary(model_logistic)
+predict_logistic<-ifelse(predict_logistic >0.5,1,0)
+
+submission_logistic<-data.frame(PassengerId = test$PassengerId, Survived = predict_logistic)
+colnames(submission)<-c("PassengerId", "Survived")
+write.csv(submission_logistic, file = "submission_logistic.csv", row.names = FALSE)
+
+
+# random Forest
+set.seed(100)
+
+model_randomforest<-randomForest(as.factor(Survived)~ Pclass + Sex + Age + SibSp + Parch + Fare +
+                    Embarked + Title + FamilySize + FamilyID2, data = train, importance = TRUE, ntree = 2000)
+
+
+Prediction_randomforest<-predict(model_randomforest, test)
+train$Random_forest<-predict(model_randomforest, train)
+sum(train$Survived== train$Random_forest)/nrow(train) # accuracy of 93%
+
+# cpart
+
+model_cforest <- cforest(as.factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare +
+                         Embarked + Title + FamilySize + FamilyID,
+                       data = train,
+                       controls=cforest_unbiased(ntree=2000, mtry=3))
+Prediction_cforest <- predict(model_cforest, test, OOB=TRUE, type = "response")
+train$Cpart<-predict(model_cforest, train, OOB=TRUE, type = "response")
+
+sum(train$Survived== train$Cpart)/nrow(train) # accuracy of 85%
+
+
+##### Second layer
+# Logistic regression
+consolidated_data<-data.frame(PassengerId = test$PassengerId, logistic = predict_logistic, Random_forest = Prediction_randomforest, Cpart = Prediction_cforest)
+consolidated_data$final_prediction<-0
+train$final_prediction<-train$Survived
+
+consolidated_logistic<-glm(as.factor(Survived) ~ Cpart + logistic + Random_forest , data = train, family = binomial)
+consolidated_data$final_prediction <- predict(consolidated_logistic, consolidated_data, type = 'response')
+
+train$final_prediction <- predict(consolidated_logistic, train, type = 'response')
+train$final_prediction<-ifelse(train$final_prediction >0.5,1,0)
+sum(train$Survived== train$final_prediction)/nrow(train)
+
+consolidated_data$final_prediction<-ifelse(consolidated_data$final_prediction >0.5,1,0)
+submission<-consolidated_data[,c(1,4)]
+colnames(submission)<-c("PassengerId", "Survived")
+write.csv(submission, file = "submission.csv", row.names = FALSE)
+
+
+# CPART
+consolidated_data<-data.frame(PassengerId = test$PassengerId, logistic = predict_logistic, Random_forest = Prediction_randomforest, Cpart = Prediction_cforest)
+consolidated_data$final_prediction<-0
+
+consolidated_cpart<-cforest(as.factor(Survived) ~ Cpart + logistic + Random_forest,
+                             data = train,
+                             controls=cforest_unbiased(ntree=2000, mtry=3))
+consolidated_data$final_prediction <- predict(consolidated_cpart, consolidated_data, OOB=TRUE, type = "response")
+
+
+submission_cpart_second<-consolidated_data[,c(1,4)]
+colnames(submission_cpart_second)<-c("PassengerId", "Survived")
+write.csv(submission_cpart_second, file = "submission_cpart_second.csv", row.names = FALSE)
